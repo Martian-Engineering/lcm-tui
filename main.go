@@ -727,7 +727,7 @@ func (m model) renderFiles() string {
 	listLines := make([]string, 0, listHeight)
 	for idx := listOffsetValue; idx < min(len(m.largeFiles), listOffsetValue+listHeight); idx++ {
 		f := m.largeFiles[idx]
-		sizeStr := formatByteSize(f.byteSize)
+		sizeStr := formatByteSizeCompact(f.byteSize)
 		line := fmt.Sprintf("  %s  %s  %s  %s  %s",
 			fileIDStyle.Render(f.fileID),
 			f.displayName(),
@@ -758,7 +758,7 @@ func (m model) renderFileDetail(detailHeight int) []string {
 
 	lines = append(lines, fmt.Sprintf("File: %s", f.fileID))
 	lines = append(lines, fmt.Sprintf("Name: %s  MIME: %s  Size: %s  Created: %s",
-		f.displayName(), f.mimeType, formatByteSize(f.byteSize), formatTimestamp(f.createdAt)))
+		f.displayName(), f.mimeType, formatByteSizeCompact(f.byteSize), formatTimestamp(f.createdAt)))
 	if f.storageURI != "" {
 		lines = append(lines, fmt.Sprintf("Storage: %s", f.storageURI))
 	}
@@ -857,16 +857,6 @@ func roleStyle(role string) lipgloss.Style {
 	default:
 		return roleToolStyle
 	}
-}
-
-func formatByteSize(bytes int64) string {
-	if bytes < 1024 {
-		return fmt.Sprintf("%d B", bytes)
-	}
-	if bytes < 1024*1024 {
-		return fmt.Sprintf("%.1f KB", float64(bytes)/1024)
-	}
-	return fmt.Sprintf("%.1f MB", float64(bytes)/(1024*1024))
 }
 
 func formatMessageCount(count int) string {

@@ -345,6 +345,71 @@ func pickTimestamp(primary string, fallback any) string {
 	}
 }
 
+const maxDisplayBytes = 100_000 // truncate very long text content for display
+
+// sanitizeForTerminal strips non-printable characters that corrupt terminal output.
+// If more than 10% of the content is non-printable, it's treated as binary and replaced
+// with a placeholder showing the byte count. Very long text is truncated.
+func sanitizeForTerminal(s string) string {
+	if len(s) == 0 {
+		return s
+	}
+	nonPrintable := 0
+	total := 0
+	for _, r := range s {
+		total++
+		if r != '\n' && r != '\r' && r != '\t' && (r < 32 || r == 127 || (r >= 0x80 && r <= 0x9F)) {
+			nonPrintable++
+		}
+	}
+	if total > 0 && nonPrintable*10 > total {
+		return fmt.Sprintf("[binary content, %s]", formatByteSizeCompact(int64(len(s))))
+	}
+
+	truncated := false
+	if len(s) > maxDisplayBytes {
+		// Truncate at a rune boundary
+		count := 0
+		for i := range s {
+			if i >= maxDisplayBytes {
+				s = s[:i]
+				truncated = true
+				break
+			}
+			count++
+		}
+	}
+
+	// Strip individual non-printable characters
+	var result string
+	if nonPrintable == 0 {
+		result = s
+	} else {
+		var b strings.Builder
+		b.Grow(len(s))
+		for _, r := range s {
+			if r == '\n' || r == '\r' || r == '\t' || (r >= 32 && r != 127 && !(r >= 0x80 && r <= 0x9F)) {
+				b.WriteRune(r)
+			}
+		}
+		result = b.String()
+	}
+	if truncated {
+		result += fmt.Sprintf("\n\n[truncated — full content is %s]", formatByteSizeCompact(int64(len(s))))
+	}
+	return result
+}
+
+func formatByteSizeCompact(bytes int64) string {
+	if bytes < 1024 {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	if bytes < 1024*1024 {
+		return fmt.Sprintf("%.1f KB", float64(bytes)/1024)
+	}
+	return fmt.Sprintf("%.1f MB", float64(bytes)/(1024*1024))
+}
+
 func normalizeMessageContent(raw json.RawMessage) string {
 	if len(raw) == 0 {
 		return ""
@@ -352,7 +417,7 @@ func normalizeMessageContent(raw json.RawMessage) string {
 
 	var asString string
 	if err := json.Unmarshal(raw, &asString); err == nil {
-		return strings.TrimSpace(asString)
+		return sanitizeForTerminal(strings.TrimSpace(asString))
 	}
 
 	var blocks []contentBlock
@@ -365,15 +430,15 @@ func normalizeMessageContent(raw json.RawMessage) string {
 			}
 		}
 		if len(parts) > 0 {
-			return strings.Join(parts, "\n")
+			return sanitizeForTerminal(strings.Join(parts, "\n"))
 		}
 	}
 
 	var asAny any
 	if err := json.Unmarshal(raw, &asAny); err == nil {
-		return strings.TrimSpace(fmt.Sprintf("%v", asAny))
+		return sanitizeForTerminal(strings.TrimSpace(fmt.Sprintf("%v", asAny)))
 	}
-	return strings.TrimSpace(string(raw))
+	return sanitizeForTerminal(strings.TrimSpace(string(raw)))
 }
 
 func formatContentBlock(block contentBlock) string {
@@ -507,6 +572,7 @@ func loadSummaryNodes(db *sql.DB, conversationID int64) (map[string]*summaryNode
 		if err := rows.Scan(&node.id, &node.kind, &node.content, &node.createdAt, &node.tokenCount); err != nil {
 			return nil, fmt.Errorf("scan summary row: %w", err)
 		}
+		node.content = sanitizeForTerminal(node.content)
 		nodes[node.id] = &node
 	}
 	if err := rows.Err(); err != nil {
@@ -600,6 +666,7 @@ func loadSummarySources(dbPath, summaryID string) ([]summarySource, error) {
 		if err := rows.Scan(&src.id, &src.role, &src.content, &src.timestamp); err != nil {
 			return nil, fmt.Errorf("scan summary source row: %w", err)
 		}
+		src.content = sanitizeForTerminal(src.content)
 		sources = append(sources, src)
 	}
 	if err := rows.Err(); err != nil {
@@ -685,7 +752,7 @@ func loadLargeFiles(dbPath, sessionID string) ([]largeFileEntry, error) {
 		f.fileName = fileName.String
 		f.mimeType = mimeType.String
 		f.byteSize = byteSize.Int64
-		f.explorationSummary = explorationSummary.String
+		f.explorationSummary = sanitizeForTerminal(explorationSummary.String)
 		files = append(files, f)
 	}
 	if err := rows.Err(); err != nil {
