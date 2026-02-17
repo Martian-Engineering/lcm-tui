@@ -595,15 +595,17 @@ func populateSummaryChildren(db *sql.DB, conversationID int64, nodes map[string]
 
 	childSet := make(map[string]bool)
 	for rows.Next() {
-		var parentID, childID string
-		if err := rows.Scan(&parentID, &childID); err != nil {
+		var sourceID, derivedID string
+		if err := rows.Scan(&sourceID, &derivedID); err != nil {
 			return nil, fmt.Errorf("scan summary edge: %w", err)
 		}
-		parentNode, hasParent := nodes[parentID]
-		_, hasChild := nodes[childID]
-		if hasParent && hasChild {
-			parentNode.children = append(parentNode.children, childID)
-			childSet[childID] = true
+		// DB stores (parent=source, summary=derived). For the TUI tree,
+		// the derived (condensed) summary is the parent and sources are children.
+		derivedNode, hasDerived := nodes[derivedID]
+		_, hasSource := nodes[sourceID]
+		if hasDerived && hasSource {
+			derivedNode.children = append(derivedNode.children, sourceID)
+			childSet[sourceID] = true
 		}
 	}
 	if err := rows.Err(); err != nil {
