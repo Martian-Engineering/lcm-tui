@@ -46,9 +46,11 @@ type model struct {
 	contextItems  []contextItemEntry
 	contextCursor int
 
-	agentCursor   int
-	sessionCursor int
-	summaryCursor int
+	agentCursor        int
+	sessionCursor      int
+	summaryCursor      int
+	summaryDetailScroll int
+	contextDetailScroll int
 
 	convViewport viewport.Model
 	width        int
@@ -337,16 +339,24 @@ func (m model) handleSummariesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "up", "k":
 		m.summaryCursor = clamp(m.summaryCursor-1, 0, len(m.summaryRows)-1)
+		m.summaryDetailScroll = 0
 		m.loadCurrentSummarySources()
 	case "down", "j":
 		m.summaryCursor = clamp(m.summaryCursor+1, 0, len(m.summaryRows)-1)
+		m.summaryDetailScroll = 0
 		m.loadCurrentSummarySources()
 	case "g":
 		m.summaryCursor = 0
+		m.summaryDetailScroll = 0
 		m.loadCurrentSummarySources()
 	case "G":
 		m.summaryCursor = max(0, len(m.summaryRows)-1)
+		m.summaryDetailScroll = 0
 		m.loadCurrentSummarySources()
+	case "J":
+		m.summaryDetailScroll++
+	case "K":
+		m.summaryDetailScroll = max(0, m.summaryDetailScroll-1)
 	case "enter", "right", "l", " ":
 		m.expandOrToggleSelectedSummary()
 	case "left", "h":
@@ -430,12 +440,20 @@ func (m model) handleContextKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "up", "k":
 		m.contextCursor = clamp(m.contextCursor-1, 0, len(m.contextItems)-1)
+		m.contextDetailScroll = 0
 	case "down", "j":
 		m.contextCursor = clamp(m.contextCursor+1, 0, len(m.contextItems)-1)
+		m.contextDetailScroll = 0
 	case "g":
 		m.contextCursor = 0
+		m.contextDetailScroll = 0
 	case "G":
 		m.contextCursor = max(0, len(m.contextItems)-1)
+		m.contextDetailScroll = 0
+	case "J":
+		m.contextDetailScroll++
+	case "K":
+		m.contextDetailScroll = max(0, m.contextDetailScroll-1)
 	case "r":
 		session, ok := m.currentSession()
 		if !ok {
@@ -594,7 +612,7 @@ func (m model) renderHelp() string {
 	case screenConversation:
 		return "j/k/up/down: scroll | pgup/pgdown | g/G: top/bottom | r: reload | l: LCM summaries | c: context | f: LCM files | b: back | q: quit"
 	case screenSummaries:
-		return "up/down: move | enter/right/l: expand-toggle | left/h: collapse | g/G: top/bottom | f: LCM files | r: reload | b: back | q: quit"
+		return "up/down: move | enter/right/l: expand-toggle | left/h: collapse | Shift+J/K: scroll detail | g/G: top/bottom | f: LCM files | r: reload | b: back | q: quit"
 	case screenFiles:
 		return "up/down: move | g/G: top/bottom | r: reload | b: back | q: quit"
 	case screenContext:
@@ -731,56 +749,61 @@ func (m model) renderSummaries() string {
 	return strings.Join(listLines, "\n") + "\n" + helpStyle.Render(strings.Repeat("-", max(20, m.width-1))) + "\n" + strings.Join(detailLines, "\n")
 }
 
-func (m model) renderSummaryDetail(detailHeight int) []string {
-	lines := make([]string, 0, detailHeight)
+func (m *model) renderSummaryDetail(detailHeight int) []string {
 	id, ok := m.currentSummaryID()
 	if !ok {
-		return append(lines, "No summary selected")
+		return padLines([]string{"No summary selected"}, detailHeight)
 	}
 	node := m.summary.nodes[id]
 	if node == nil {
-		return append(lines, "Missing summary node")
+		return padLines([]string{"Missing summary node"}, detailHeight)
 	}
 
-	lines = append(lines, fmt.Sprintf("Summary: %s", id))
-	lines = append(lines, fmt.Sprintf("Created: %s  Tokens: %d", node.createdAt, node.tokenCount))
-	lines = append(lines, "Content:")
+	// Build ALL lines (no height limit)
+	var allLines []string
+	allLines = append(allLines, fmt.Sprintf("Summary: %s", id))
+	allLines = append(allLines, fmt.Sprintf("Created: %s  Tokens: %d", node.createdAt, node.tokenCount))
+	allLines = append(allLines, "Content:")
 	wrappedContent := wrapText(node.content, max(20, m.width-4))
 	for _, line := range strings.Split(wrappedContent, "\n") {
-		if len(lines) >= detailHeight {
-			break
-		}
-		lines = append(lines, "  "+line)
-	}
-	if len(lines) < detailHeight {
-		lines = append(lines, "Sources:")
+		allLines = append(allLines, "  "+line)
 	}
 
+	allLines = append(allLines, "Sources:")
 	if errMsg, exists := m.summarySourceErr[id]; exists {
-		if len(lines) < detailHeight {
-			lines = append(lines, "  error: "+errMsg)
+		allLines = append(allLines, "  error: "+errMsg)
+	} else {
+		sources := m.summarySources[id]
+		if len(sources) == 0 {
+			allLines = append(allLines, "  (no source messages)")
+		} else {
+			for _, src := range sources {
+				content := oneLine(src.content)
+				content = truncateString(content, max(8, m.width-24))
+				line := fmt.Sprintf("  #%d %s %s", src.id, strings.ToUpper(src.role), content)
+				allLines = append(allLines, roleStyle(src.role).Render(line))
+			}
 		}
-		return padLines(lines, detailHeight)
 	}
 
-	sources := m.summarySources[id]
-	if len(sources) == 0 {
-		if len(lines) < detailHeight {
-			lines = append(lines, "  (no source messages)")
+	// Clamp scroll offset
+	maxScroll := max(0, len(allLines)-detailHeight)
+	m.summaryDetailScroll = clamp(m.summaryDetailScroll, 0, maxScroll)
+
+	// Slice visible window
+	start := m.summaryDetailScroll
+	end := min(len(allLines), start+detailHeight)
+	visible := allLines[start:end]
+
+	// Add scroll indicator
+	if maxScroll > 0 {
+		indicator := fmt.Sprintf(" [%d/%d lines, Shift+J/K to scroll]", m.summaryDetailScroll+detailHeight, len(allLines))
+		if len(visible) > 0 {
+			visible[0] = visible[0] + helpStyle.Render(indicator)
 		}
-		return padLines(lines, detailHeight)
 	}
 
-	for _, src := range sources {
-		if len(lines) >= detailHeight {
-			break
-		}
-		content := oneLine(src.content)
-		content = truncateString(content, max(8, m.width-24))
-		line := fmt.Sprintf("  #%d %s %s", src.id, strings.ToUpper(src.role), content)
-		lines = append(lines, roleStyle(src.role).Render(line))
-	}
-	return padLines(lines, detailHeight)
+	return padLines(visible, detailHeight)
 }
 
 var (
@@ -899,33 +922,48 @@ func (m model) formatContextItemLine(item contextItemEntry) string {
 		item.ordinal, roleStyle.Render(item.kind), item.messageID, item.tokenCount, preview)
 }
 
-func (m model) renderContextDetail(detailHeight int) []string {
-	lines := make([]string, 0, detailHeight)
+func (m *model) renderContextDetail(detailHeight int) []string {
 	if m.contextCursor < 0 || m.contextCursor >= len(m.contextItems) {
-		return append(lines, "No item selected")
+		return padLines([]string{"No item selected"}, detailHeight)
 	}
 	item := m.contextItems[m.contextCursor]
 
+	var allLines []string
 	if item.itemType == "summary" {
-		lines = append(lines, fmt.Sprintf("Summary: %s [%s]", item.summaryID, item.kind))
-		lines = append(lines, fmt.Sprintf("Tokens: %d  Created: %s", item.tokenCount, formatTimestamp(item.createdAt)))
+		allLines = append(allLines, fmt.Sprintf("Summary: %s [%s]", item.summaryID, item.kind))
+		allLines = append(allLines, fmt.Sprintf("Tokens: %d  Created: %s", item.tokenCount, formatTimestamp(item.createdAt)))
 	} else {
-		lines = append(lines, fmt.Sprintf("Message: #%d [%s]", item.messageID, item.kind))
-		lines = append(lines, fmt.Sprintf("Tokens: %d  Created: %s", item.tokenCount, formatTimestamp(item.createdAt)))
+		allLines = append(allLines, fmt.Sprintf("Message: #%d [%s]", item.messageID, item.kind))
+		allLines = append(allLines, fmt.Sprintf("Tokens: %d  Created: %s", item.tokenCount, formatTimestamp(item.createdAt)))
 	}
-	lines = append(lines, "")
+	allLines = append(allLines, "")
 	content := strings.TrimSpace(item.content)
 	if content == "" {
 		content = "(empty)"
 	}
 	wrapped := wrapText(content, max(20, m.width-4))
 	for _, line := range strings.Split(wrapped, "\n") {
-		if len(lines) >= detailHeight {
-			break
-		}
-		lines = append(lines, "  "+line)
+		allLines = append(allLines, "  "+line)
 	}
-	return padLines(lines, detailHeight)
+
+	// Clamp scroll offset
+	maxScroll := max(0, len(allLines)-detailHeight)
+	m.contextDetailScroll = clamp(m.contextDetailScroll, 0, maxScroll)
+
+	// Slice visible window
+	start := m.contextDetailScroll
+	end := min(len(allLines), start+detailHeight)
+	visible := allLines[start:end]
+
+	// Add scroll indicator
+	if maxScroll > 0 {
+		indicator := fmt.Sprintf(" [%d/%d lines, Shift+J/K to scroll]", m.contextDetailScroll+detailHeight, len(allLines))
+		if len(visible) > 0 {
+			visible[0] = visible[0] + helpStyle.Render(indicator)
+		}
+	}
+
+	return padLines(visible, detailHeight)
 }
 
 func (m *model) resizeViewport() {
