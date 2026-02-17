@@ -29,11 +29,13 @@ type agentEntry struct {
 
 // sessionEntry describes one JSONL session file.
 type sessionEntry struct {
-	id           string
-	filename     string
-	path         string
-	updatedAt    time.Time
-	messageCount int
+	id            string
+	filename      string
+	path          string
+	updatedAt     time.Time
+	messageCount  int
+	summaryCount  int
+	fileCount     int
 }
 
 // sessionFileEntry stores lightweight metadata used for incremental loading.
@@ -61,6 +63,25 @@ type summaryNode struct {
 	tokenCount int
 	children   []string
 	expanded   bool
+}
+
+// largeFileEntry describes one large file intercepted by LCM.
+type largeFileEntry struct {
+	fileID             string
+	conversationID     int64
+	fileName           string
+	mimeType           string
+	byteSize           int64
+	storageURI         string
+	explorationSummary string
+	createdAt          string
+}
+
+func (f largeFileEntry) displayName() string {
+	if f.fileName != "" {
+		return f.fileName
+	}
+	return "(unnamed)"
 }
 
 // summarySource is a source message attached to a summary.
@@ -172,7 +193,7 @@ func discoverSessionFiles(agent agentEntry) ([]sessionFileEntry, error) {
 	return sessions, nil
 }
 
-func loadSessionBatch(files []sessionFileEntry, offset, limit int) ([]sessionEntry, int, error) {
+func loadSessionBatch(files []sessionFileEntry, offset, limit int, lcmDBPath string) ([]sessionEntry, int, error) {
 	if offset < 0 {
 		offset = 0
 	}
@@ -189,28 +210,39 @@ func loadSessionBatch(files []sessionFileEntry, offset, limit int) ([]sessionEnt
 	}
 
 	sessions := make([]sessionEntry, 0, end-offset)
+	sessionIDs := make([]string, 0, end-offset)
 	for _, file := range files[offset:end] {
 		messageCount, err := countMessages(file.path)
 		if err != nil {
 			messageCount = -1
 		}
+		id := strings.TrimSuffix(file.filename, filepath.Ext(file.filename))
+		sessionIDs = append(sessionIDs, id)
 		sessions = append(sessions, sessionEntry{
-			id:           strings.TrimSuffix(file.filename, filepath.Ext(file.filename)),
+			id:           id,
 			filename:     file.filename,
 			path:         file.path,
 			updatedAt:    file.updatedAt,
 			messageCount: messageCount,
 		})
 	}
+
+	summaryCounts := loadSummaryCounts(lcmDBPath, sessionIDs)
+	fileCounts := loadFileCounts(lcmDBPath, sessionIDs)
+	for i := range sessions {
+		sessions[i].summaryCount = summaryCounts[sessions[i].id]
+		sessions[i].fileCount = fileCounts[sessions[i].id]
+	}
+
 	return sessions, end, nil
 }
 
-func loadSessions(agent agentEntry) ([]sessionEntry, error) {
+func loadSessions(agent agentEntry, lcmDBPath string) ([]sessionEntry, error) {
 	files, err := discoverSessionFiles(agent)
 	if err != nil {
 		return nil, err
 	}
-	sessions, _, err := loadSessionBatch(files, 0, len(files))
+	sessions, _, err := loadSessionBatch(files, 0, len(files), lcmDBPath)
 	if err != nil {
 		return nil, err
 	}
@@ -574,6 +606,134 @@ func loadSummarySources(dbPath, summaryID string) ([]summarySource, error) {
 		return nil, fmt.Errorf("iterate summary source rows: %w", err)
 	}
 	return sources, nil
+}
+
+func loadSummaryCounts(dbPath string, sessionIDs []string) map[string]int {
+	counts := make(map[string]int, len(sessionIDs))
+	if len(sessionIDs) == 0 {
+		return counts
+	}
+	db, err := openLCMDB(dbPath)
+	if err != nil {
+		return counts
+	}
+	defer db.Close()
+
+	// Build query with placeholders
+	placeholders := make([]string, len(sessionIDs))
+	args := make([]any, len(sessionIDs))
+	for i, id := range sessionIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	query := fmt.Sprintf(`
+		SELECT c.session_id, COUNT(s.summary_id)
+		FROM conversations c
+		JOIN summaries s ON s.conversation_id = c.conversation_id
+		WHERE c.session_id IN (%s)
+		GROUP BY c.session_id
+	`, strings.Join(placeholders, ","))
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return counts
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var sessionID string
+		var count int
+		if err := rows.Scan(&sessionID, &count); err != nil {
+			continue
+		}
+		counts[sessionID] = count
+	}
+	return counts
+}
+
+func loadLargeFiles(dbPath, sessionID string) ([]largeFileEntry, error) {
+	db, err := openLCMDB(dbPath)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	conversationID, err := lookupConversationID(db, sessionID)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := db.Query(`
+		SELECT file_id, conversation_id, file_name, mime_type, byte_size, storage_uri, exploration_summary, created_at
+		FROM large_files
+		WHERE conversation_id = ?
+		ORDER BY created_at ASC
+	`, conversationID)
+	if err != nil {
+		return nil, fmt.Errorf("query large files for conversation %d: %w", conversationID, err)
+	}
+	defer rows.Close()
+
+	files := make([]largeFileEntry, 0, 8)
+	for rows.Next() {
+		var f largeFileEntry
+		var fileName, mimeType, explorationSummary sql.NullString
+		var byteSize sql.NullInt64
+		if err := rows.Scan(&f.fileID, &f.conversationID, &fileName, &mimeType, &byteSize, &f.storageURI, &explorationSummary, &f.createdAt); err != nil {
+			return nil, fmt.Errorf("scan large file row: %w", err)
+		}
+		f.fileName = fileName.String
+		f.mimeType = mimeType.String
+		f.byteSize = byteSize.Int64
+		f.explorationSummary = explorationSummary.String
+		files = append(files, f)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate large file rows: %w", err)
+	}
+	return files, nil
+}
+
+func loadFileCounts(dbPath string, sessionIDs []string) map[string]int {
+	counts := make(map[string]int, len(sessionIDs))
+	if len(sessionIDs) == 0 {
+		return counts
+	}
+	db, err := openLCMDB(dbPath)
+	if err != nil {
+		return counts
+	}
+	defer db.Close()
+
+	placeholders := make([]string, len(sessionIDs))
+	args := make([]any, len(sessionIDs))
+	for i, id := range sessionIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	query := fmt.Sprintf(`
+		SELECT c.session_id, COUNT(lf.file_id)
+		FROM conversations c
+		JOIN large_files lf ON lf.conversation_id = c.conversation_id
+		WHERE c.session_id IN (%s)
+		GROUP BY c.session_id
+	`, strings.Join(placeholders, ","))
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return counts
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var sessionID string
+		var count int
+		if err := rows.Scan(&sessionID, &count); err != nil {
+			continue
+		}
+		counts[sessionID] = count
+	}
+	return counts
 }
 
 func formatTimeForList(ts time.Time) string {

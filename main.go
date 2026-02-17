@@ -18,6 +18,7 @@ const (
 	screenSessions
 	screenConversation
 	screenSummaries
+	screenFiles
 )
 
 const (
@@ -37,6 +38,9 @@ type model struct {
 	messages          []sessionMessage
 	summary           summaryGraph
 	summaryRows       []summaryRow
+
+	largeFiles  []largeFileEntry
+	fileCursor  int
 
 	agentCursor   int
 	sessionCursor int
@@ -128,6 +132,8 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleConversationKey(msg)
 	case screenSummaries:
 		return m.handleSummariesKey(msg)
+	case screenFiles:
+		return m.handleFilesKey(msg)
 	default:
 		return m, nil
 	}
@@ -234,6 +240,20 @@ func (m model) handleConversationKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "b", "backspace":
 		m.screen = screenSessions
 		m.status = "Back to sessions"
+	case "r":
+		session, ok := m.currentSession()
+		if !ok {
+			m.status = "No session selected"
+			return m, nil
+		}
+		messages, err := parseSessionMessages(session.path)
+		if err != nil {
+			m.status = "Error: " + err.Error()
+			return m, nil
+		}
+		m.messages = messages
+		m.refreshConversationViewport()
+		m.status = fmt.Sprintf("Reloaded %d messages", len(messages))
 	case "l":
 		session, ok := m.currentSession()
 		if !ok {
@@ -253,6 +273,25 @@ func (m model) handleConversationKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.loadCurrentSummarySources()
 		m.screen = screenSummaries
 		m.status = fmt.Sprintf("Loaded %d summaries for conversation %d", len(summary.nodes), summary.conversationID)
+	case "f":
+		session, ok := m.currentSession()
+		if !ok {
+			m.status = "No session selected"
+			return m, nil
+		}
+		files, err := loadLargeFiles(m.paths.lcmDBPath, session.id)
+		if err != nil {
+			m.status = "Error: " + err.Error()
+			return m, nil
+		}
+		m.largeFiles = files
+		m.fileCursor = 0
+		m.screen = screenFiles
+		if len(files) == 0 {
+			m.status = fmt.Sprintf("No large files for session %s", session.id)
+		} else {
+			m.status = fmt.Sprintf("Loaded %d large files", len(files))
+		}
 	}
 	return m, nil
 }
@@ -293,6 +332,56 @@ func (m model) handleSummariesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.summarySourceErr = make(map[string]string)
 		m.loadCurrentSummarySources()
 		m.status = fmt.Sprintf("Reloaded %d summaries", len(summary.nodes))
+	case "b", "backspace":
+		m.screen = screenConversation
+		m.status = "Back to conversation"
+	}
+	return m, nil
+}
+
+func (m model) handleFilesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "up", "k":
+		m.fileCursor = clamp(m.fileCursor-1, 0, len(m.largeFiles)-1)
+	case "down", "j":
+		m.fileCursor = clamp(m.fileCursor+1, 0, len(m.largeFiles)-1)
+	case "g":
+		m.fileCursor = 0
+	case "G":
+		m.fileCursor = max(0, len(m.largeFiles)-1)
+	case "r":
+		session, ok := m.currentSession()
+		if !ok {
+			m.status = "No session selected"
+			return m, nil
+		}
+		files, err := loadLargeFiles(m.paths.lcmDBPath, session.id)
+		if err != nil {
+			m.status = "Error: " + err.Error()
+			return m, nil
+		}
+		m.largeFiles = files
+		m.fileCursor = clamp(m.fileCursor, 0, len(m.largeFiles)-1)
+		m.status = fmt.Sprintf("Reloaded %d large files", len(files))
+	case "f":
+		session, ok := m.currentSession()
+		if !ok {
+			m.status = "No session selected"
+			return m, nil
+		}
+		files, err := loadLargeFiles(m.paths.lcmDBPath, session.id)
+		if err != nil {
+			m.status = "Error: " + err.Error()
+			return m, nil
+		}
+		m.largeFiles = files
+		m.fileCursor = 0
+		m.screen = screenFiles
+		if len(files) == 0 {
+			m.status = "No large files for this session"
+		} else {
+			m.status = fmt.Sprintf("Loaded %d large files", len(files))
+		}
 	case "b", "backspace":
 		m.screen = screenConversation
 		m.status = "Back to conversation"
@@ -418,6 +507,8 @@ func (m model) renderHeader() string {
 		title += " | Conversation"
 	case screenSummaries:
 		title += " | LCM Summary DAG"
+	case screenFiles:
+		title += " | LCM Large Files"
 	}
 
 	help := m.renderHelp()
@@ -431,9 +522,11 @@ func (m model) renderHelp() string {
 	case screenSessions:
 		return "up/down: move | enter: open conversation | b: back | r: reload | q: quit"
 	case screenConversation:
-		return "j/k/up/down: scroll | pgup/pgdown | g/G: top/bottom | l: open LCM summaries | b: back | q: quit"
+		return "j/k/up/down: scroll | pgup/pgdown | g/G: top/bottom | r: reload | l: LCM summaries | f: LCM files | b: back | q: quit"
 	case screenSummaries:
-		return "up/down: move | enter/right/l: expand-toggle | left/h: collapse | g/G: top/bottom | r: reload | b: back | q: quit"
+		return "up/down: move | enter/right/l: expand-toggle | left/h: collapse | g/G: top/bottom | f: LCM files | r: reload | b: back | q: quit"
+	case screenFiles:
+		return "up/down: move | g/G: top/bottom | r: reload | b: back | q: quit"
 	default:
 		return "q: quit"
 	}
@@ -449,6 +542,8 @@ func (m model) renderBody() string {
 		return m.renderConversation()
 	case screenSummaries:
 		return m.renderSummaries()
+	case screenFiles:
+		return m.renderFiles()
 	default:
 		return "Unknown screen"
 	}
@@ -495,9 +590,16 @@ func (m model) renderSessions() string {
 	for idx := offset; idx < min(len(m.sessions), offset+visible); idx++ {
 		session := m.sessions[idx]
 		messageCount := formatMessageCount(session.messageCount)
-		line := fmt.Sprintf("  %s  %s  msgs:%s", session.filename, formatTimeForList(session.updatedAt), messageCount)
+		extras := ""
+		if session.summaryCount > 0 {
+			extras += fmt.Sprintf("  sums:%d", session.summaryCount)
+		}
+		if session.fileCount > 0 {
+			extras += fmt.Sprintf("  files:%d", session.fileCount)
+		}
+		line := fmt.Sprintf("  %s  %s  msgs:%s%s", session.filename, formatTimeForList(session.updatedAt), messageCount, extras)
 		if idx == m.sessionCursor {
-			line = selectedStyle.Render(fmt.Sprintf("> %s  %s  msgs:%s", session.filename, formatTimeForList(session.updatedAt), messageCount))
+			line = selectedStyle.Render(fmt.Sprintf("> %s  %s  msgs:%s%s", session.filename, formatTimeForList(session.updatedAt), messageCount, extras))
 		}
 		lines = append(lines, line)
 	}
@@ -607,6 +709,76 @@ func (m model) renderSummaryDetail(detailHeight int) []string {
 	return padLines(lines, detailHeight)
 }
 
+var (
+	fileIDStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("183"))
+	fileMimeStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+)
+
+func (m model) renderFiles() string {
+	if len(m.largeFiles) == 0 {
+		return "No large files found for this session"
+	}
+
+	available := max(4, m.height-4)
+	detailHeight := max(7, available/2)
+	listHeight := max(3, available-detailHeight-1)
+
+	listOffsetValue := listOffset(m.fileCursor, len(m.largeFiles), listHeight)
+	listLines := make([]string, 0, listHeight)
+	for idx := listOffsetValue; idx < min(len(m.largeFiles), listOffsetValue+listHeight); idx++ {
+		f := m.largeFiles[idx]
+		sizeStr := formatByteSize(f.byteSize)
+		line := fmt.Sprintf("  %s  %s  %s  %s  %s",
+			fileIDStyle.Render(f.fileID),
+			f.displayName(),
+			fileMimeStyle.Render(f.mimeType),
+			sizeStr,
+			formatTimestamp(f.createdAt))
+		if idx == m.fileCursor {
+			line = selectedStyle.Render(fmt.Sprintf("> %s  %s  %s  %s  %s",
+				f.fileID,
+				f.displayName(),
+				f.mimeType,
+				sizeStr,
+				formatTimestamp(f.createdAt)))
+		}
+		listLines = append(listLines, line)
+	}
+
+	detailLines := m.renderFileDetail(detailHeight)
+	return strings.Join(listLines, "\n") + "\n" + helpStyle.Render(strings.Repeat("-", max(20, m.width-1))) + "\n" + strings.Join(detailLines, "\n")
+}
+
+func (m model) renderFileDetail(detailHeight int) []string {
+	lines := make([]string, 0, detailHeight)
+	if m.fileCursor < 0 || m.fileCursor >= len(m.largeFiles) {
+		return append(lines, "No file selected")
+	}
+	f := m.largeFiles[m.fileCursor]
+
+	lines = append(lines, fmt.Sprintf("File: %s", f.fileID))
+	lines = append(lines, fmt.Sprintf("Name: %s  MIME: %s  Size: %s  Created: %s",
+		f.displayName(), f.mimeType, formatByteSize(f.byteSize), formatTimestamp(f.createdAt)))
+	if f.storageURI != "" {
+		lines = append(lines, fmt.Sprintf("Storage: %s", f.storageURI))
+	}
+	lines = append(lines, "")
+	lines = append(lines, "Exploration Summary:")
+
+	summary := strings.TrimSpace(f.explorationSummary)
+	if summary == "" {
+		summary = "(no exploration summary)"
+	}
+	wrappedSummary := wrapText(summary, max(20, m.width-4))
+	for _, line := range strings.Split(wrappedSummary, "\n") {
+		if len(lines) >= detailHeight {
+			break
+		}
+		lines = append(lines, "  "+line)
+	}
+	return padLines(lines, detailHeight)
+}
+
 func (m *model) resizeViewport() {
 	width := max(20, m.width-2)
 	height := max(3, m.height-4)
@@ -629,7 +801,7 @@ func (m *model) refreshConversationViewport() {
 	}
 	content := renderConversationText(m.messages, m.convViewport.Width)
 	m.convViewport.SetContent(content)
-	m.convViewport.GotoTop()
+	m.convViewport.GotoBottom()
 }
 
 func renderConversationText(messages []sessionMessage, width int) string {
@@ -685,6 +857,16 @@ func roleStyle(role string) lipgloss.Style {
 	default:
 		return roleToolStyle
 	}
+}
+
+func formatByteSize(bytes int64) string {
+	if bytes < 1024 {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	if bytes < 1024*1024 {
+		return fmt.Sprintf("%.1f KB", float64(bytes)/1024)
+	}
+	return fmt.Sprintf("%.1f MB", float64(bytes)/(1024*1024))
 }
 
 func formatMessageCount(count int) string {
@@ -800,7 +982,7 @@ func (m *model) loadInitialSessions(agent agentEntry) error {
 }
 
 func (m *model) appendSessionBatch(limit int) (int, error) {
-	batch, nextCursor, err := loadSessionBatch(m.sessionFiles, m.sessionFileCursor, limit)
+	batch, nextCursor, err := loadSessionBatch(m.sessionFiles, m.sessionFileCursor, limit, m.paths.lcmDBPath)
 	if err != nil {
 		return 0, err
 	}
