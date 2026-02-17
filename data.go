@@ -92,6 +92,19 @@ type summarySource struct {
 	timestamp string
 }
 
+// contextItemEntry represents one item in the active LCM context window.
+type contextItemEntry struct {
+	ordinal    int
+	itemType   string // "summary" or "message"
+	summaryID  string // set when itemType == "summary"
+	messageID  int64  // set when itemType == "message"
+	kind       string // "leaf", "condensed", or role for messages
+	tokenCount int
+	content    string // full sanitized content
+	preview    string // single-line preview for list
+	createdAt  string
+}
+
 // summaryGraph is the in-memory DAG used by the summary drill-down view.
 type summaryGraph struct {
 	conversationID int64
@@ -803,6 +816,86 @@ func loadFileCounts(dbPath string, sessionIDs []string) map[string]int {
 		counts[sessionID] = count
 	}
 	return counts
+}
+
+func loadContextItems(dbPath, sessionID string) ([]contextItemEntry, error) {
+	db, err := openLCMDB(dbPath)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	conversationID, err := lookupConversationID(db, sessionID)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := db.Query(`
+		SELECT
+			ci.ordinal,
+			ci.item_type,
+			ci.summary_id,
+			ci.message_id,
+			CASE
+				WHEN ci.item_type = 'summary' THEN COALESCE(s.kind, '')
+				ELSE COALESCE(m.role, '')
+			END AS kind,
+			CASE
+				WHEN ci.item_type = 'summary' THEN COALESCE(s.token_count, 0)
+				ELSE COALESCE(m.token_count, 0)
+			END AS token_count,
+			CASE
+				WHEN ci.item_type = 'summary' THEN COALESCE(s.content, '')
+				ELSE COALESCE(m.content, '')
+			END AS content,
+			CASE
+				WHEN ci.item_type = 'summary' THEN COALESCE(s.created_at, '')
+				ELSE COALESCE(m.created_at, '')
+			END AS created_at
+		FROM context_items ci
+		LEFT JOIN summaries s ON ci.summary_id = s.summary_id
+		LEFT JOIN messages m ON ci.message_id = m.message_id
+		WHERE ci.conversation_id = ?
+		ORDER BY ci.ordinal
+	`, conversationID)
+	if err != nil {
+		return nil, fmt.Errorf("query context items for conversation %d: %w", conversationID, err)
+	}
+	defer rows.Close()
+
+	var items []contextItemEntry
+	for rows.Next() {
+		var item contextItemEntry
+		var summaryID sql.NullString
+		var messageID sql.NullInt64
+		var content string
+		if err := rows.Scan(
+			&item.ordinal,
+			&item.itemType,
+			&summaryID,
+			&messageID,
+			&item.kind,
+			&item.tokenCount,
+			&content,
+			&item.createdAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan context item: %w", err)
+		}
+		if summaryID.Valid {
+			item.summaryID = summaryID.String
+		}
+		if messageID.Valid {
+			item.messageID = messageID.Int64
+		}
+		content = sanitizeForTerminal(content)
+		item.content = content
+		item.preview = oneLine(content)
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate context items: %w", err)
+	}
+	return items, nil
 }
 
 func formatTimeForList(ts time.Time) string {

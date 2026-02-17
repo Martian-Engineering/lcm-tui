@@ -19,6 +19,7 @@ const (
 	screenConversation
 	screenSummaries
 	screenFiles
+	screenContext
 )
 
 const (
@@ -41,6 +42,9 @@ type model struct {
 
 	largeFiles  []largeFileEntry
 	fileCursor  int
+
+	contextItems  []contextItemEntry
+	contextCursor int
 
 	agentCursor   int
 	sessionCursor int
@@ -134,6 +138,8 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleSummariesKey(msg)
 	case screenFiles:
 		return m.handleFilesKey(msg)
+	case screenContext:
+		return m.handleContextKey(msg)
 	default:
 		return m, nil
 	}
@@ -292,6 +298,37 @@ func (m model) handleConversationKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		} else {
 			m.status = fmt.Sprintf("Loaded %d large files", len(files))
 		}
+	case "c":
+		session, ok := m.currentSession()
+		if !ok {
+			m.status = "No session selected"
+			return m, nil
+		}
+		items, err := loadContextItems(m.paths.lcmDBPath, session.id)
+		if err != nil {
+			m.status = "Error: " + err.Error()
+			return m, nil
+		}
+		m.contextItems = items
+		m.contextCursor = 0
+		m.screen = screenContext
+		if len(items) == 0 {
+			m.status = "No context items for this session"
+		} else {
+			totalTokens := 0
+			summaryCount := 0
+			messageCount := 0
+			for _, it := range items {
+				totalTokens += it.tokenCount
+				if it.itemType == "summary" {
+					summaryCount++
+				} else {
+					messageCount++
+				}
+			}
+			m.status = fmt.Sprintf("Context: %d summaries + %d messages = %d items, %dk tokens",
+				summaryCount, messageCount, len(items), totalTokens/1000)
+		}
 	}
 	return m, nil
 }
@@ -382,6 +419,37 @@ func (m model) handleFilesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		} else {
 			m.status = fmt.Sprintf("Loaded %d large files", len(files))
 		}
+	case "b", "backspace":
+		m.screen = screenConversation
+		m.status = "Back to conversation"
+	}
+	return m, nil
+}
+
+func (m model) handleContextKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "up", "k":
+		m.contextCursor = clamp(m.contextCursor-1, 0, len(m.contextItems)-1)
+	case "down", "j":
+		m.contextCursor = clamp(m.contextCursor+1, 0, len(m.contextItems)-1)
+	case "g":
+		m.contextCursor = 0
+	case "G":
+		m.contextCursor = max(0, len(m.contextItems)-1)
+	case "r":
+		session, ok := m.currentSession()
+		if !ok {
+			m.status = "No session selected"
+			return m, nil
+		}
+		items, err := loadContextItems(m.paths.lcmDBPath, session.id)
+		if err != nil {
+			m.status = "Error: " + err.Error()
+			return m, nil
+		}
+		m.contextItems = items
+		m.contextCursor = clamp(m.contextCursor, 0, len(m.contextItems)-1)
+		m.status = fmt.Sprintf("Reloaded %d context items", len(items))
 	case "b", "backspace":
 		m.screen = screenConversation
 		m.status = "Back to conversation"
@@ -509,6 +577,8 @@ func (m model) renderHeader() string {
 		title += " | LCM Summary DAG"
 	case screenFiles:
 		title += " | LCM Large Files"
+	case screenContext:
+		title += " | LCM Active Context"
 	}
 
 	help := m.renderHelp()
@@ -522,10 +592,12 @@ func (m model) renderHelp() string {
 	case screenSessions:
 		return "up/down: move | enter: open conversation | b: back | r: reload | q: quit"
 	case screenConversation:
-		return "j/k/up/down: scroll | pgup/pgdown | g/G: top/bottom | r: reload | l: LCM summaries | f: LCM files | b: back | q: quit"
+		return "j/k/up/down: scroll | pgup/pgdown | g/G: top/bottom | r: reload | l: LCM summaries | c: context | f: LCM files | b: back | q: quit"
 	case screenSummaries:
 		return "up/down: move | enter/right/l: expand-toggle | left/h: collapse | g/G: top/bottom | f: LCM files | r: reload | b: back | q: quit"
 	case screenFiles:
+		return "up/down: move | g/G: top/bottom | r: reload | b: back | q: quit"
+	case screenContext:
 		return "up/down: move | g/G: top/bottom | r: reload | b: back | q: quit"
 	default:
 		return "q: quit"
@@ -544,6 +616,8 @@ func (m model) renderBody() string {
 		return m.renderSummaries()
 	case screenFiles:
 		return m.renderFiles()
+	case screenContext:
+		return m.renderContext()
 	default:
 		return "Unknown screen"
 	}
@@ -771,6 +845,81 @@ func (m model) renderFileDetail(detailHeight int) []string {
 	}
 	wrappedSummary := wrapText(summary, max(20, m.width-4))
 	for _, line := range strings.Split(wrappedSummary, "\n") {
+		if len(lines) >= detailHeight {
+			break
+		}
+		lines = append(lines, "  "+line)
+	}
+	return padLines(lines, detailHeight)
+}
+
+func (m model) renderContext() string {
+	if len(m.contextItems) == 0 {
+		return "No context items found for this session"
+	}
+
+	available := max(4, m.height-4)
+	detailHeight := max(7, available/3)
+	listHeight := max(3, available-detailHeight-1)
+
+	listOffsetValue := listOffset(m.contextCursor, len(m.contextItems), listHeight)
+	listLines := make([]string, 0, listHeight)
+	for idx := listOffsetValue; idx < min(len(m.contextItems), listOffsetValue+listHeight); idx++ {
+		item := m.contextItems[idx]
+		line := m.formatContextItemLine(item)
+		if idx == m.contextCursor {
+			line = selectedStyle.Render(line)
+		}
+		listLines = append(listLines, line)
+	}
+
+	detailLines := m.renderContextDetail(detailHeight)
+	return strings.Join(listLines, "\n") + "\n" + helpStyle.Render(strings.Repeat("-", max(20, m.width-1))) + "\n" + strings.Join(detailLines, "\n")
+}
+
+func (m model) formatContextItemLine(item contextItemEntry) string {
+	maxPreview := max(8, m.width-60)
+	preview := truncateString(item.preview, maxPreview)
+
+	if item.itemType == "summary" {
+		return fmt.Sprintf("  %3d  %-10s [%s, %dt] %s",
+			item.ordinal, item.kind, item.summaryID[:min(16, len(item.summaryID))], item.tokenCount, preview)
+	}
+	// message
+	roleStyle := roleUserStyle
+	switch item.kind {
+	case "assistant":
+		roleStyle = roleAssistantStyle
+	case "system":
+		roleStyle = roleSystemStyle
+	case "tool":
+		roleStyle = roleToolStyle
+	}
+	return fmt.Sprintf("  %3d  %-10s [msg %d, %dt] %s",
+		item.ordinal, roleStyle.Render(item.kind), item.messageID, item.tokenCount, preview)
+}
+
+func (m model) renderContextDetail(detailHeight int) []string {
+	lines := make([]string, 0, detailHeight)
+	if m.contextCursor < 0 || m.contextCursor >= len(m.contextItems) {
+		return append(lines, "No item selected")
+	}
+	item := m.contextItems[m.contextCursor]
+
+	if item.itemType == "summary" {
+		lines = append(lines, fmt.Sprintf("Summary: %s [%s]", item.summaryID, item.kind))
+		lines = append(lines, fmt.Sprintf("Tokens: %d  Created: %s", item.tokenCount, formatTimestamp(item.createdAt)))
+	} else {
+		lines = append(lines, fmt.Sprintf("Message: #%d [%s]", item.messageID, item.kind))
+		lines = append(lines, fmt.Sprintf("Tokens: %d  Created: %s", item.tokenCount, formatTimestamp(item.createdAt)))
+	}
+	lines = append(lines, "")
+	content := strings.TrimSpace(item.content)
+	if content == "" {
+		content = "(empty)"
+	}
+	wrapped := wrapText(content, max(20, m.width-4))
+	for _, line := range strings.Split(wrapped, "\n") {
 		if len(lines) >= detailHeight {
 			break
 		}
