@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -58,6 +59,7 @@ type model struct {
 
 	summarySources   map[string][]summarySource
 	summarySourceErr map[string]string
+	pendingDissolve  *dissolvePlan
 
 	status string
 }
@@ -229,7 +231,11 @@ func (m model) handleSessionsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.messages = messages
 		m.screen = screenConversation
 		m.refreshConversationViewport()
-		m.status = fmt.Sprintf("Loaded %d messages from %s", len(messages), session.filename)
+		if session.conversationID > 0 {
+			m.status = fmt.Sprintf("Loaded %d messages from %s (conv_id:%d)", len(messages), session.filename, session.conversationID)
+		} else {
+			m.status = fmt.Sprintf("Loaded %d messages from %s", len(messages), session.filename)
+		}
 	case "b", "backspace":
 		m.screen = screenAgents
 		m.sessionFiles = nil
@@ -358,6 +364,17 @@ func (m model) handleConversationKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) handleSummariesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.pendingDissolve != nil {
+		switch msg.String() {
+		case "y", "enter":
+			m.confirmPendingDissolve()
+		case "n", "esc", "b", "backspace", "d":
+			m.pendingDissolve = nil
+			m.status = "Dissolve canceled"
+		}
+		return m, nil
+	}
+
 	switch msg.String() {
 	case "up", "k":
 		m.summaryCursor = clamp(m.summaryCursor-1, 0, len(m.summaryRows)-1)
@@ -383,6 +400,8 @@ func (m model) handleSummariesKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.expandOrToggleSelectedSummary()
 	case "left", "h":
 		m.collapseSelectedSummary()
+	case "d":
+		m.startPendingDissolve()
 	case "r":
 		session, ok := m.currentSession()
 		if !ok {
@@ -539,6 +558,88 @@ func (m *model) collapseSelectedSummary() {
 	m.status = "Summary already collapsed"
 }
 
+// startPendingDissolve builds a dry-run dissolve preview for the selected node.
+func (m *model) startPendingDissolve() {
+	summaryID, ok := m.currentSummaryID()
+	if !ok {
+		m.status = "No summary selected"
+		return
+	}
+	if m.summary.conversationID <= 0 {
+		m.status = "Missing conversation ID for current summary graph"
+		return
+	}
+
+	db, err := openLCMDB(m.paths.lcmDBPath)
+	if err != nil {
+		m.status = "Error: " + err.Error()
+		return
+	}
+	defer db.Close()
+
+	plan, err := buildDissolvePlan(context.Background(), db, m.summary.conversationID, summaryID)
+	if err != nil {
+		m.status = "Error: " + err.Error()
+		return
+	}
+
+	m.pendingDissolve = &plan
+	m.status = fmt.Sprintf("Ready to dissolve %s", summaryID)
+}
+
+// confirmPendingDissolve applies the pending dissolve and refreshes the DAG view.
+func (m *model) confirmPendingDissolve() {
+	if m.pendingDissolve == nil {
+		return
+	}
+	plan := *m.pendingDissolve
+
+	db, err := openLCMDB(m.paths.lcmDBPath)
+	if err != nil {
+		m.pendingDissolve = nil
+		m.status = "Error: " + err.Error()
+		return
+	}
+	defer db.Close()
+
+	newCount, err := applyDissolvePlan(context.Background(), db, plan, false)
+	if err != nil {
+		m.pendingDissolve = nil
+		m.status = "Error: " + err.Error()
+		return
+	}
+
+	session, ok := m.currentSession()
+	if !ok {
+		m.pendingDissolve = nil
+		m.status = fmt.Sprintf("Dissolved %s, but no session is selected for reload", plan.target.summaryID)
+		return
+	}
+
+	summary, err := loadSummaryGraph(m.paths.lcmDBPath, session.id)
+	if err != nil {
+		m.pendingDissolve = nil
+		m.status = fmt.Sprintf("Dissolved %s, but reload failed: %v", plan.target.summaryID, err)
+		return
+	}
+
+	m.summary = summary
+	m.summaryRows = buildSummaryRows(summary)
+	m.summaryCursor = clamp(m.summaryCursor, 0, len(m.summaryRows)-1)
+	m.summaryDetailScroll = 0
+	m.summarySources = make(map[string][]summarySource)
+	m.summarySourceErr = make(map[string]string)
+	m.loadCurrentSummarySources()
+	m.pendingDissolve = nil
+	m.status = fmt.Sprintf("Dissolved %s: restored %d parents (%dt → %dt, %+dt). Context items: %d",
+		plan.target.summaryID,
+		len(plan.parents),
+		plan.target.tokenCount,
+		plan.totalParentTokens,
+		plan.totalParentTokens-plan.target.tokenCount,
+		newCount)
+}
+
 func (m *model) loadCurrentSummarySources() {
 	id, ok := m.currentSummaryID()
 	if !ok {
@@ -613,12 +714,24 @@ func (m model) renderHeader() string {
 		title += " | Sessions" + agentName
 	case screenConversation:
 		title += " | Conversation"
+		if conversationID, ok := m.currentConversationID(); ok {
+			title += fmt.Sprintf(" | conv_id:%d", conversationID)
+		}
 	case screenSummaries:
 		title += " | LCM Summary DAG"
+		if m.summary.conversationID > 0 {
+			title += fmt.Sprintf(" | conv_id:%d", m.summary.conversationID)
+		}
 	case screenFiles:
 		title += " | LCM Large Files"
+		if conversationID, ok := m.currentConversationID(); ok {
+			title += fmt.Sprintf(" | conv_id:%d", conversationID)
+		}
 	case screenContext:
 		title += " | LCM Active Context"
+		if conversationID, ok := m.currentConversationID(); ok {
+			title += fmt.Sprintf(" | conv_id:%d", conversationID)
+		}
 	}
 
 	help := m.renderHelp()
@@ -634,7 +747,10 @@ func (m model) renderHelp() string {
 	case screenConversation:
 		return "j/k/up/down: scroll | pgup/pgdown | g/G: top/bottom | r: reload | l: LCM summaries | c: context | f: LCM files | b: back | q: quit"
 	case screenSummaries:
-		return "up/down: move | enter/right/l: expand-toggle | left/h: collapse | Shift+J/K: scroll detail | g/G: top/bottom | f: LCM files | r: reload | b: back | q: quit"
+		if m.pendingDissolve != nil {
+			return "Dissolve confirmation | y/enter: confirm | n/esc: cancel | q: quit"
+		}
+		return "up/down: move | enter/right/l: expand-toggle | left/h: collapse | d: dissolve selected condensed node | Shift+J/K: scroll detail | g/G: top/bottom | f: LCM files | r: reload | b: back | q: quit"
 	case screenFiles:
 		return "up/down: move | g/G: top/bottom | r: reload | b: back | q: quit"
 	case screenContext:
@@ -705,6 +821,9 @@ func (m model) renderSessions() string {
 		session := m.sessions[idx]
 		messageCount := formatMessageCount(session.messageCount)
 		extras := ""
+		if session.conversationID > 0 {
+			extras += fmt.Sprintf("  conv_id:%d", session.conversationID)
+		}
 		if session.summaryCount > 0 {
 			extras += fmt.Sprintf("  sums:%d", session.summaryCount)
 		}
@@ -733,6 +852,9 @@ func (m model) renderConversation() string {
 func (m model) renderSummaries() string {
 	if len(m.summary.nodes) == 0 {
 		return "No LCM summaries found for this session"
+	}
+	if m.pendingDissolve != nil {
+		return m.renderDissolveConfirmation()
 	}
 	if len(m.summaryRows) == 0 {
 		return "Summary graph is empty"
@@ -769,6 +891,40 @@ func (m model) renderSummaries() string {
 
 	detailLines := m.renderSummaryDetail(detailHeight)
 	return strings.Join(listLines, "\n") + "\n" + helpStyle.Render(strings.Repeat("-", max(20, m.width-1))) + "\n" + strings.Join(detailLines, "\n")
+}
+
+// renderDissolveConfirmation draws the preview/confirmation overlay for DAG dissolve.
+func (m model) renderDissolveConfirmation() string {
+	if m.pendingDissolve == nil {
+		return "No dissolve confirmation pending"
+	}
+
+	plan := m.pendingDissolve
+	lines := []string{
+		fmt.Sprintf("Dissolve summary: %s", plan.target.summaryID),
+		fmt.Sprintf("Target: kind=%s depth=%d tokens=%d context_ordinal=%d", plan.target.kind, plan.target.depth, plan.target.tokenCount, plan.target.ordinal),
+		fmt.Sprintf("Token impact: %d -> %d (%+d)", plan.target.tokenCount, plan.totalParentTokens, plan.totalParentTokens-plan.target.tokenCount),
+		fmt.Sprintf("Ordinal shift: %d item(s) will shift by +%d", plan.itemsToShift, plan.shift),
+		"",
+		"Parent summaries to restore:",
+	}
+
+	availableHeight := max(10, m.height-4)
+	maxParentLines := max(1, availableHeight-len(lines)-2)
+	parentCount := len(plan.parents)
+	for idx := 0; idx < min(parentCount, maxParentLines); idx++ {
+		parent := plan.parents[idx]
+		preview := truncateString(oneLine(parent.content), max(8, m.width-40))
+		lines = append(lines, fmt.Sprintf("  [%d] %s (%s, d%d, %dt) %s",
+			parent.ordinal, parent.summaryID, parent.kind, parent.depth, parent.tokenCount, preview))
+	}
+	if parentCount > maxParentLines {
+		lines = append(lines, fmt.Sprintf("  ... and %d more parent summaries", parentCount-maxParentLines))
+	}
+
+	lines = append(lines, "")
+	lines = append(lines, "Press y or Enter to apply dissolve. Press n or Esc to cancel.")
+	return strings.Join(lines, "\n")
 }
 
 func (m *model) renderSummaryDetail(detailHeight int) []string {
@@ -1087,6 +1243,14 @@ func (m model) currentSession() (sessionEntry, bool) {
 		return sessionEntry{}, false
 	}
 	return m.sessions[m.sessionCursor], true
+}
+
+func (m model) currentConversationID() (int64, bool) {
+	session, ok := m.currentSession()
+	if !ok || session.conversationID <= 0 {
+		return 0, false
+	}
+	return session.conversationID, true
 }
 
 func (m model) currentSummaryID() (string, bool) {

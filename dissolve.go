@@ -35,6 +35,14 @@ type dissolveParent struct {
 	content    string
 }
 
+type dissolvePlan struct {
+	target            dissolveTarget
+	parents           []dissolveParent
+	totalParentTokens int
+	itemsToShift      int
+	shift             int
+}
+
 // runDissolveCommand executes the standalone dissolve CLI path.
 func runDissolveCommand(args []string) error {
 	opts, conversationID, err := parseDissolveArgs(args)
@@ -55,58 +63,83 @@ func runDissolveCommand(args []string) error {
 
 	ctx := context.Background()
 
-	// Load the target condensed summary
-	target, err := loadDissolveTarget(ctx, db, conversationID, opts.summaryID)
+	plan, err := buildDissolvePlan(ctx, db, conversationID, opts.summaryID)
 	if err != nil {
 		return err
-	}
-
-	// Load its parent summaries in order
-	parents, err := loadDissolveParents(ctx, db, opts.summaryID)
-	if err != nil {
-		return err
-	}
-	if len(parents) == 0 {
-		return fmt.Errorf("summary %s has no parent summaries — nothing to dissolve", opts.summaryID)
 	}
 
 	// Show plan
 	fmt.Printf("Dissolve %s (%s, d%d, %dt) at context ordinal %d\n",
-		target.summaryID, target.kind, target.depth, target.tokenCount, target.ordinal)
-	fmt.Printf("Restore %d parent summaries:\n", len(parents))
+		plan.target.summaryID, plan.target.kind, plan.target.depth, plan.target.tokenCount, plan.target.ordinal)
+	fmt.Printf("Restore %d parent summaries:\n", len(plan.parents))
 
-	totalParentTokens := 0
-	for _, p := range parents {
+	for _, p := range plan.parents {
 		preview := oneLine(p.content)
 		preview = truncateString(preview, 80)
 		fmt.Printf("  [%d] %s (%s, d%d, %dt) %s\n", p.ordinal, p.summaryID, p.kind, p.depth, p.tokenCount, preview)
-		totalParentTokens += p.tokenCount
 	}
 	fmt.Printf("\nToken impact: %dt condensed → %dt restored (%+dt)\n",
-		target.tokenCount, totalParentTokens, totalParentTokens-target.tokenCount)
-
-	// Count items that will shift
-	var totalItems int
-	err = db.QueryRowContext(ctx, `
-		SELECT COUNT(*) FROM context_items
-		WHERE conversation_id = ? AND ordinal > ?
-	`, conversationID, target.ordinal).Scan(&totalItems)
-	if err != nil {
-		return fmt.Errorf("count items to shift: %w", err)
-	}
-	shift := len(parents) - 1
-	fmt.Printf("Ordinal shift: %d items after ordinal %d will shift by +%d\n", totalItems, target.ordinal, shift)
+		plan.target.tokenCount, plan.totalParentTokens, plan.totalParentTokens-plan.target.tokenCount)
+	fmt.Printf("Ordinal shift: %d items after ordinal %d will shift by +%d\n", plan.itemsToShift, plan.target.ordinal, plan.shift)
 
 	if !opts.apply {
 		fmt.Println("\nDry run. Use --apply to execute.")
 		return nil
 	}
 
-	// Execute in transaction
 	fmt.Println("\nApplying...")
+	newCount, err := applyDissolvePlan(ctx, db, plan, opts.purge)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("\nDone. Context now has %d items. Changes take effect on next conversation turn.\n", newCount)
+	return nil
+}
+
+// buildDissolvePlan validates a condensed target and computes preview stats
+// (restored parents, token impact, and ordinal shifts) without mutating DB state.
+func buildDissolvePlan(ctx context.Context, db *sql.DB, conversationID int64, summaryID string) (dissolvePlan, error) {
+	target, err := loadDissolveTarget(ctx, db, conversationID, summaryID)
+	if err != nil {
+		return dissolvePlan{}, err
+	}
+
+	parents, err := loadDissolveParents(ctx, db, summaryID)
+	if err != nil {
+		return dissolvePlan{}, err
+	}
+	if len(parents) == 0 {
+		return dissolvePlan{}, fmt.Errorf("summary %s has no parent summaries — nothing to dissolve", summaryID)
+	}
+
+	totalParentTokens := 0
+	for _, parent := range parents {
+		totalParentTokens += parent.tokenCount
+	}
+
+	var itemsToShift int
+	err = db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM context_items
+		WHERE conversation_id = ? AND ordinal > ?
+	`, conversationID, target.ordinal).Scan(&itemsToShift)
+	if err != nil {
+		return dissolvePlan{}, fmt.Errorf("count items to shift: %w", err)
+	}
+
+	return dissolvePlan{
+		target:            target,
+		parents:           parents,
+		totalParentTokens: totalParentTokens,
+		itemsToShift:      itemsToShift,
+		shift:             len(parents) - 1,
+	}, nil
+}
+
+// applyDissolvePlan performs the transactional context rewrite from a dry-run plan.
+func applyDissolvePlan(ctx context.Context, db *sql.DB, plan dissolvePlan, purge bool) (int, error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("begin transaction: %w", err)
+		return 0, fmt.Errorf("begin transaction: %w", err)
 	}
 	rollback := true
 	defer func() {
@@ -115,90 +148,75 @@ func runDissolveCommand(args []string) error {
 		}
 	}()
 
-	// Step 1: Delete the condensed summary's context_item
 	res, err := tx.ExecContext(ctx, `
 		DELETE FROM context_items
 		WHERE conversation_id = ? AND ordinal = ? AND summary_id = ?
-	`, conversationID, target.ordinal, target.summaryID)
+	`, plan.target.conversationID, plan.target.ordinal, plan.target.summaryID)
 	if err != nil {
-		return fmt.Errorf("delete condensed context_item: %w", err)
+		return 0, fmt.Errorf("delete condensed context_item: %w", err)
 	}
 	deleted, _ := res.RowsAffected()
 	if deleted != 1 {
-		return fmt.Errorf("expected to delete 1 context_item, deleted %d", deleted)
+		return 0, fmt.Errorf("expected to delete 1 context_item, deleted %d", deleted)
 	}
-	fmt.Printf("  ✓ Deleted context_item at ordinal %d\n", target.ordinal)
 
-	// Step 2: Shift items after the removed ordinal up by (parentCount - 1)
-	// Use a two-phase approach to avoid PRIMARY KEY conflicts:
-	// Phase A: move to temporary high ordinals
-	// Phase B: set final ordinals
-	if shift > 0 {
+	if plan.shift > 0 {
 		const tempOffset = 10_000_000
 		_, err = tx.ExecContext(ctx, `
 			UPDATE context_items
 			SET ordinal = ordinal + ?
 			WHERE conversation_id = ? AND ordinal > ?
-		`, tempOffset, conversationID, target.ordinal)
+		`, tempOffset, plan.target.conversationID, plan.target.ordinal)
 		if err != nil {
-			return fmt.Errorf("shift items to temp ordinals: %w", err)
+			return 0, fmt.Errorf("shift items to temp ordinals: %w", err)
 		}
 
 		_, err = tx.ExecContext(ctx, `
 			UPDATE context_items
 			SET ordinal = ordinal - ? + ?
 			WHERE conversation_id = ? AND ordinal >= ?
-		`, tempOffset, shift, conversationID, tempOffset)
+		`, tempOffset, plan.shift, plan.target.conversationID, tempOffset)
 		if err != nil {
-			return fmt.Errorf("shift items to final ordinals: %w", err)
+			return 0, fmt.Errorf("shift items to final ordinals: %w", err)
 		}
-		fmt.Printf("  ✓ Shifted %d items by +%d ordinals\n", totalItems, shift)
 	}
 
-	// Step 3: Insert parent summaries at ordinals [target.ordinal, target.ordinal + len(parents) - 1]
-	for i, p := range parents {
-		newOrdinal := target.ordinal + int64(i)
+	for i, parent := range plan.parents {
+		newOrdinal := plan.target.ordinal + int64(i)
 		_, err = tx.ExecContext(ctx, `
 			INSERT INTO context_items (conversation_id, ordinal, item_type, summary_id, created_at)
 			VALUES (?, ?, 'summary', ?, datetime('now'))
-		`, conversationID, newOrdinal, p.summaryID)
+		`, plan.target.conversationID, newOrdinal, parent.summaryID)
 		if err != nil {
-			return fmt.Errorf("insert parent %s at ordinal %d: %w", p.summaryID, newOrdinal, err)
+			return 0, fmt.Errorf("insert parent %s at ordinal %d: %w", parent.summaryID, newOrdinal, err)
 		}
 	}
-	fmt.Printf("  ✓ Inserted %d parent summaries at ordinals %d–%d\n",
-		len(parents), target.ordinal, target.ordinal+int64(len(parents)-1))
 
-	// Step 4: Optionally purge the condensed summary record
-	if opts.purge {
-		// Remove parent links first
+	if purge {
 		_, err = tx.ExecContext(ctx, `
 			DELETE FROM summary_parents WHERE summary_id = ?
-		`, target.summaryID)
+		`, plan.target.summaryID)
 		if err != nil {
-			return fmt.Errorf("delete summary_parents for %s: %w", target.summaryID, err)
+			return 0, fmt.Errorf("delete summary_parents for %s: %w", plan.target.summaryID, err)
 		}
 		_, err = tx.ExecContext(ctx, `
 			DELETE FROM summaries WHERE summary_id = ?
-		`, target.summaryID)
+		`, plan.target.summaryID)
 		if err != nil {
-			return fmt.Errorf("delete summary record %s: %w", target.summaryID, err)
+			return 0, fmt.Errorf("delete summary record %s: %w", plan.target.summaryID, err)
 		}
-		fmt.Printf("  ✓ Purged summary record %s\n", target.summaryID)
 	}
 
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit: %w", err)
+		return 0, fmt.Errorf("commit: %w", err)
 	}
 	rollback = false
 
-	// Verify
 	var newCount int
 	_ = db.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM context_items WHERE conversation_id = ?
-	`, conversationID).Scan(&newCount)
-	fmt.Printf("\nDone. Context now has %d items. Changes take effect on next conversation turn.\n", newCount)
-	return nil
+	`, plan.target.conversationID).Scan(&newCount)
+	return newCount, nil
 }
 
 func parseDissolveArgs(args []string) (dissolveOptions, int64, error) {

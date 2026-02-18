@@ -33,13 +33,14 @@ type agentEntry struct {
 
 // sessionEntry describes one JSONL session file.
 type sessionEntry struct {
-	id           string
-	filename     string
-	path         string
-	updatedAt    time.Time
-	messageCount int
-	summaryCount int
-	fileCount    int
+	id             string
+	filename       string
+	path           string
+	updatedAt      time.Time
+	conversationID int64
+	messageCount   int
+	summaryCount   int
+	fileCount      int
 }
 
 // sessionFileEntry stores lightweight metadata used for incremental loading.
@@ -250,9 +251,11 @@ func loadSessionBatch(files []sessionFileEntry, offset, limit int, lcmDBPath str
 
 	summaryCounts := loadSummaryCounts(lcmDBPath, sessionIDs)
 	fileCounts := loadFileCounts(lcmDBPath, sessionIDs)
+	conversationIDs := loadConversationIDs(lcmDBPath, sessionIDs)
 	for i := range sessions {
 		sessions[i].summaryCount = summaryCounts[sessions[i].id]
 		sessions[i].fileCount = fileCounts[sessions[i].id]
+		sessions[i].conversationID = conversationIDs[sessions[i].id]
 	}
 
 	return sessions, end, nil
@@ -824,6 +827,48 @@ func loadFileCounts(dbPath string, sessionIDs []string) map[string]int {
 		counts[sessionID] = count
 	}
 	return counts
+}
+
+func loadConversationIDs(dbPath string, sessionIDs []string) map[string]int64 {
+	// Resolve one LCM conversation_id per session for list/header display.
+	ids := make(map[string]int64, len(sessionIDs))
+	if len(sessionIDs) == 0 {
+		return ids
+	}
+	db, err := openLCMDB(dbPath)
+	if err != nil {
+		return ids
+	}
+	defer db.Close()
+
+	placeholders := make([]string, len(sessionIDs))
+	args := make([]any, len(sessionIDs))
+	for i, sessionID := range sessionIDs {
+		placeholders[i] = "?"
+		args[i] = sessionID
+	}
+	query := fmt.Sprintf(`
+		SELECT session_id, MAX(conversation_id)
+		FROM conversations
+		WHERE session_id IN (%s)
+		GROUP BY session_id
+	`, strings.Join(placeholders, ","))
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return ids
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var sessionID string
+		var conversationID int64
+		if err := rows.Scan(&sessionID, &conversationID); err != nil {
+			continue
+		}
+		ids[sessionID] = conversationID
+	}
+	return ids
 }
 
 func loadContextItems(dbPath, sessionID string) ([]contextItemEntry, error) {
