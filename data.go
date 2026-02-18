@@ -104,6 +104,7 @@ type contextItemEntry struct {
 	summaryID  string // set when itemType == "summary"
 	messageID  int64  // set when itemType == "message"
 	kind       string // "leaf", "condensed", or role for messages
+	depth      int    // summary depth (0 for leaves, 1+ for condensed)
 	tokenCount int
 	content    string // full sanitized content
 	preview    string // single-line preview for list
@@ -894,6 +895,10 @@ func loadContextItems(dbPath, sessionID string) ([]contextItemEntry, error) {
 				ELSE COALESCE(m.role, '')
 			END AS kind,
 			CASE
+				WHEN ci.item_type = 'summary' THEN COALESCE(s.depth, 0)
+				ELSE 0
+			END AS depth,
+			CASE
 				WHEN ci.item_type = 'summary' THEN COALESCE(s.token_count, 0)
 				ELSE COALESCE(m.token_count, 0)
 			END AS token_count,
@@ -928,6 +933,7 @@ func loadContextItems(dbPath, sessionID string) ([]contextItemEntry, error) {
 			&summaryID,
 			&messageID,
 			&item.kind,
+			&item.depth,
 			&item.tokenCount,
 			&content,
 			&item.createdAt,

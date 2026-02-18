@@ -1083,8 +1083,12 @@ func (m model) formatContextItemLine(item contextItemEntry) string {
 	preview := truncateString(item.preview, maxPreview)
 
 	if item.itemType == "summary" {
+		kindLabel := item.kind
+		if item.kind == "condensed" {
+			kindLabel = fmt.Sprintf("d%d", item.depth)
+		}
 		return fmt.Sprintf("  %3d  %-10s [%s, %dt] %s",
-			item.ordinal, item.kind, item.summaryID[:min(16, len(item.summaryID))], item.tokenCount, preview)
+			item.ordinal, kindLabel, item.summaryID[:min(16, len(item.summaryID))], item.tokenCount, preview)
 	}
 	// message
 	roleStyle := roleUserStyle
@@ -1108,7 +1112,11 @@ func (m *model) renderContextDetail(detailHeight int) []string {
 
 	var allLines []string
 	if item.itemType == "summary" {
-		allLines = append(allLines, fmt.Sprintf("Summary: %s [%s]", item.summaryID, item.kind))
+		kindLabel := item.kind
+		if item.kind == "condensed" {
+			kindLabel = fmt.Sprintf("condensed d%d", item.depth)
+		}
+		allLines = append(allLines, fmt.Sprintf("Summary: %s [%s]", item.summaryID, kindLabel))
 		allLines = append(allLines, fmt.Sprintf("Tokens: %d  Created: %s", item.tokenCount, formatTimestamp(item.createdAt)))
 	} else {
 		allLines = append(allLines, fmt.Sprintf("Message: #%d [%s]", item.messageID, item.kind))
