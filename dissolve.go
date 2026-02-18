@@ -225,7 +225,7 @@ func parseDissolveArgs(args []string) (dissolveOptions, int64, error) {
 
 	summaryID := fs.String("summary-id", "", "summary ID to dissolve (required)")
 	apply := fs.Bool("apply", false, "apply changes to the DB")
-	purge := fs.Bool("purge", false, "also delete the condensed summary record")
+	purge := fs.Bool("purge", true, "delete the condensed summary record from DB (use --purge=false to keep)")
 
 	// Normalize: pull positional args out so flags parse correctly regardless of order
 	normalized, err := normalizeDissolveArgs(args)

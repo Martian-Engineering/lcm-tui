@@ -602,7 +602,7 @@ func (m *model) confirmPendingDissolve() {
 	}
 	defer db.Close()
 
-	newCount, err := applyDissolvePlan(context.Background(), db, plan, false)
+	newCount, err := applyDissolvePlan(context.Background(), db, plan, true)
 	if err != nil {
 		m.pendingDissolve = nil
 		m.status = "Error: " + err.Error()
