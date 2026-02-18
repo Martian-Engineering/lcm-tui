@@ -360,7 +360,7 @@ func pickTimestamp(primary string, fallback any) string {
 		if ms <= 0 {
 			return ""
 		}
-		return time.UnixMilli(ms).UTC().Format(time.RFC3339Nano)
+		return time.UnixMilli(ms).Local().Format(time.RFC3339Nano)
 	default:
 		return ""
 	}
@@ -915,8 +915,13 @@ func formatTimestamp(ts string) string {
 	if trimmed == "" {
 		return ""
 	}
+	// Try RFC3339 first (with timezone info)
 	if parsed, err := time.Parse(time.RFC3339Nano, trimmed); err == nil {
 		return parsed.Local().Format("2006-01-02 15:04:05")
+	}
+	// SQLite bare datetime (stored as UTC, no timezone indicator)
+	if parsed, err := time.Parse("2006-01-02 15:04:05", trimmed); err == nil {
+		return parsed.In(time.UTC).Local().Format("2006-01-02 15:04:05")
 	}
 	return trimmed
 }

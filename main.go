@@ -777,7 +777,7 @@ func (m *model) renderSummaryDetail(detailHeight int) []string {
 	// Build ALL lines (no height limit)
 	var allLines []string
 	allLines = append(allLines, fmt.Sprintf("Summary: %s", id))
-	allLines = append(allLines, fmt.Sprintf("Created: %s  Tokens: %d", node.createdAt, node.tokenCount))
+	allLines = append(allLines, fmt.Sprintf("Created: %s  Tokens: %d", formatTimestamp(node.createdAt), node.tokenCount))
 	allLines = append(allLines, "Content:")
 	wrappedContent := wrapText(node.content, max(20, m.width-4))
 	for _, line := range strings.Split(wrappedContent, "\n") {
