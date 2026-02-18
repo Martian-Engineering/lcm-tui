@@ -63,6 +63,7 @@ type sessionMessage struct {
 type summaryNode struct {
 	id         string
 	kind       string
+	depth      int
 	content    string
 	createdAt  string
 	tokenCount int
@@ -582,7 +583,7 @@ func lookupConversationID(db *sql.DB, sessionID string) (int64, error) {
 
 func loadSummaryNodes(db *sql.DB, conversationID int64) (map[string]*summaryNode, error) {
 	rows, err := db.Query(`
-		SELECT summary_id, kind, content, created_at, token_count
+		SELECT summary_id, kind, COALESCE(depth, 0), content, created_at, token_count
 		FROM summaries
 		WHERE conversation_id = ?
 	`, conversationID)
@@ -594,7 +595,7 @@ func loadSummaryNodes(db *sql.DB, conversationID int64) (map[string]*summaryNode
 	nodes := make(map[string]*summaryNode)
 	for rows.Next() {
 		var node summaryNode
-		if err := rows.Scan(&node.id, &node.kind, &node.content, &node.createdAt, &node.tokenCount); err != nil {
+		if err := rows.Scan(&node.id, &node.kind, &node.depth, &node.content, &node.createdAt, &node.tokenCount); err != nil {
 			return nil, fmt.Errorf("scan summary row: %w", err)
 		}
 		node.content = sanitizeForTerminal(node.content)

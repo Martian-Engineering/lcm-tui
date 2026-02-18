@@ -882,7 +882,11 @@ func (m model) renderSummaries() string {
 		}
 		preview := oneLine(node.content)
 		preview = truncateString(preview, max(8, m.width-50))
-		line := fmt.Sprintf("%s%s %s [%s, %dt] %s", strings.Repeat("  ", row.depth), marker, node.id, node.kind, node.tokenCount, preview)
+		kindLabel := node.kind
+		if node.kind == "condensed" {
+			kindLabel = fmt.Sprintf("d%d", node.depth)
+		}
+		line := fmt.Sprintf("%s%s %s [%s, %dt] %s", strings.Repeat("  ", row.depth), marker, node.id, kindLabel, node.tokenCount, preview)
 		if idx == m.summaryCursor {
 			line = selectedStyle.Render(line)
 		}
