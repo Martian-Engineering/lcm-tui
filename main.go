@@ -82,6 +82,13 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "transplant" {
+		if err := runTransplantCommand(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "lcm-tui transplant failed: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	m := newModel()
 	program := tea.NewProgram(m, tea.WithAltScreen())
