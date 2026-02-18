@@ -26,6 +26,14 @@ go build -o lcm-tui .
 
 Navigate with arrow keys, Enter to drill in, `b` to go back, `q` to quit.
 
+Repair corrupted LCM summaries:
+
+```bash
+./lcm-tui repair <conversation_id>           # dry-run (default)
+./lcm-tui repair <conversation_id> --apply   # apply repairs
+./lcm-tui repair --all --dry-run             # scan all conversations
+```
+
 ## Requirements
 
 - OpenClaw with LCM enabled (`~/.openclaw/lcm.db` and `~/.openclaw/agents/` must exist)

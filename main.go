@@ -40,15 +40,15 @@ type model struct {
 	summary           summaryGraph
 	summaryRows       []summaryRow
 
-	largeFiles  []largeFileEntry
-	fileCursor  int
+	largeFiles []largeFileEntry
+	fileCursor int
 
 	contextItems  []contextItemEntry
 	contextCursor int
 
-	agentCursor        int
-	sessionCursor      int
-	summaryCursor      int
+	agentCursor         int
+	sessionCursor       int
+	summaryCursor       int
 	summaryDetailScroll int
 	contextDetailScroll int
 
@@ -75,6 +75,14 @@ var (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "repair" {
+		if err := runRepairCommand(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "lcm-tui repair failed: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	m := newModel()
 	program := tea.NewProgram(m, tea.WithAltScreen())
 	if _, err := program.Run(); err != nil {

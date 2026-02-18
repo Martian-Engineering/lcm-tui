@@ -17,8 +17,12 @@ import (
 
 // appDataPaths stores resolved locations for session files and the LCM DB.
 type appDataPaths struct {
-	agentsDir string
-	lcmDBPath string
+	agentsDir        string
+	lcmDBPath        string
+	openclawDir      string
+	openclawConfig   string
+	openclawEnv      string
+	openclawCredsDir string
 }
 
 // agentEntry describes one agent directory under ~/.openclaw/agents.
@@ -29,13 +33,13 @@ type agentEntry struct {
 
 // sessionEntry describes one JSONL session file.
 type sessionEntry struct {
-	id            string
-	filename      string
-	path          string
-	updatedAt     time.Time
-	messageCount  int
-	summaryCount  int
-	fileCount     int
+	id           string
+	filename     string
+	path         string
+	updatedAt    time.Time
+	messageCount int
+	summaryCount int
+	fileCount    int
 }
 
 // sessionFileEntry stores lightweight metadata used for incremental loading.
@@ -151,8 +155,12 @@ func resolveDataPaths() (appDataPaths, error) {
 	}
 	base := filepath.Join(home, ".openclaw")
 	return appDataPaths{
-		agentsDir: filepath.Join(base, "agents"),
-		lcmDBPath: filepath.Join(base, "lcm.db"),
+		agentsDir:        filepath.Join(base, "agents"),
+		lcmDBPath:        filepath.Join(base, "lcm.db"),
+		openclawDir:      base,
+		openclawConfig:   filepath.Join(base, "openclaw.json"),
+		openclawEnv:      filepath.Join(base, ".env"),
+		openclawCredsDir: filepath.Join(base, "credentials"),
 	}, nil
 }
 
